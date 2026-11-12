@@ -1,5 +1,6 @@
 #!/bin/sh
-# Quality gate. Every step must pass; the first failure stops the run.
+# Quality gate: format, lint, types, security scans and tests.
+# Every step must pass; the first failure stops the run.
 # Run it with:  docker compose --profile tools run --rm --build check
 set -eu
 
@@ -19,5 +20,8 @@ bandit -q -c pyproject.toml -r app worker
 
 step "Security: dependencies (pip-audit)"
 pip-audit
+
+step "Tests (pytest)"
+pytest
 
 printf '\nAll checks passed.\n'

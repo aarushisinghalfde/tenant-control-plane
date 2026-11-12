@@ -2,7 +2,7 @@ name: tenant-control-plane
 
 services:
   # Single quality gate: format check, lint, type check, security scans
-  # (and the test suite, once it exists).
+  # and the test suite.
   #   docker compose --profile tools run --rm --build check
   check:
     image: tenant-control-plane:dev
