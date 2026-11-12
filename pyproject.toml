@@ -1,0 +1,52 @@
+[project]
+name = "tenant-control-plane"
+version = "0.1.0"
+description = "Asynchronous tenant provisioning control plane: FastAPI, PostgreSQL, RabbitMQ."
+readme = "README.md"
+requires-python = ">=3.12"
+# Dependencies live in requirements.txt / requirements-dev.txt so the Docker
+# image can install them in a cached layer before the source is copied in.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+  "E", "W",   # pycodestyle
+  "F",        # pyflakes
+  "I",        # import sorting
+  "B",        # bugbear: likely bugs
+  "UP",       # modern Python syntax
+  "SIM",      # simplifications
+  "C4",       # comprehensions
+  "N",        # naming conventions
+  "RET",      # return statements
+  "ARG",      # unused arguments
+  "ASYNC",    # async pitfalls (blocking calls in coroutines)
+  "T20",      # no print()
+  "PT",       # pytest style
+  "RUF",      # ruff-specific
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ARG"]  # pytest fixtures are often requested only for their side effects
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["app", "worker", "tests"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["asyncpg", "asyncpg.*"]  # asyncpg ships no type information
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra --strict-markers"
+
+[tool.bandit]
+exclude_dirs = ["tests"]

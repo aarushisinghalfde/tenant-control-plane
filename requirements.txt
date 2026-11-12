@@ -1,0 +1,9 @@
+# Runtime dependencies.
+# Lower bounds: versions the code is written against.
+# Upper bounds: keep a future major release from silently breaking the build.
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+pydantic>=2.8,<3
+pydantic-settings>=2.4,<3
+asyncpg>=0.29,<1
+aio-pika>=9.4,<10

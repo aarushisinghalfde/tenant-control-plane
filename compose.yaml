@@ -1,0 +1,25 @@
+name: tenant-control-plane
+
+services:
+  # Single quality gate: format check, lint, type check, security scans
+  # (and the test suite, once it exists).
+  #   docker compose --profile tools run --rm --build check
+  check:
+    image: tenant-control-plane:dev
+    build:
+      context: .
+      target: dev
+    profiles: ["tools"]
+    command: ["sh", "scripts/check.sh"]
+
+  # Formats and auto-fixes the code in place on your machine.
+  #   docker compose --profile tools run --rm --build fmt
+  fmt:
+    image: tenant-control-plane:dev
+    build:
+      context: .
+      target: dev
+    profiles: ["tools"]
+    volumes:
+      - .:/srv
+    command: ["sh", "-c", "ruff format . && ruff check --fix ."]

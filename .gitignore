@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tooling caches and reports
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local environment overrides (never commit real values)
+.env
+
+# Editors and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
