@@ -6,6 +6,16 @@ provisioning work, and reports progress back over the broker.
 
 > Work in progress: sections are filled in as each part of the system lands.
 
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | Layers and class diagram, startup sequence, step-by-step lifecycle of a request through the outbox to RabbitMQ |
+| [docs/evidence/](docs/evidence/README.md) | Manual runs against the real stack, with commands, output and screenshots |
+| [Broker outage](docs/evidence/outbox-broker-outage.md) | Writes succeed while RabbitMQ is down; the event is published once it returns |
+| [Rejected writes](docs/evidence/rejected-writes.md) | Duplicate slugs, stale versions and invalid transitions are refused and publish nothing |
+| <http://localhost:8000/docs> | Interactive API reference (after boot), generated from the code |
+
 ## Prerequisites
 
 - Git
@@ -22,7 +32,8 @@ docker compose --profile tools run --rm --build check     # quality gate + tests
 ```
 
 The API is then on <http://localhost:8000>, with interactive docs at
-<http://localhost:8000/docs>.
+<http://localhost:8000/docs>. The RabbitMQ management UI is on <http://localhost:15672>
+(user `tenants`, password `tenants`; local-development credentials only).
 
 | Purpose | Command |
 | --- | --- |
@@ -94,6 +105,49 @@ resource that does not exist returns `404`.
 | `not_found` / `method_not_allowed` | 404 / 405 | Unknown route or wrong HTTP method |
 | `internal_error` | 500 | Anything unexpected (details are logged, never returned) |
 
+## Messaging
+
+Tasks leave the control plane through a **transactional outbox**. A request never talks
+to the broker: it writes the tenant, the task and an `outbox` row in one transaction.
+A background relay inside the control plane then publishes committed rows and marks
+them, so an event goes out only after its write is durable, never on rollback, and is
+not lost if the process dies between commit and publish.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as Control plane (API)
+    participant DB as PostgreSQL
+    participant R as Outbox relay
+    participant MQ as RabbitMQ
+    C->>API: POST /v1/tenants
+    API->>DB: BEGIN; INSERT tenant, task, outbox row; COMMIT
+    API-->>C: 202 {tenant, task}
+    loop every 200 ms
+        R->>DB: SELECT unpublished rows FOR UPDATE SKIP LOCKED
+        R->>MQ: publish (persistent, publisher confirm)
+        MQ-->>R: ack
+        R->>DB: SET published_at; COMMIT
+    end
+```
+
+- **At-least-once.** If the relay dies after the broker confirms but before it marks the
+  row, the event is sent again. The AMQP `message_id` is the task id, so consumers can
+  drop duplicates.
+- **Retries.** A failed publish increments the row's `attempts`, stops the batch (events
+  keep their order) and retries with exponential backoff and jitter, capped at 30 s.
+- **Replicas.** `SKIP LOCKED` lets several relays share the outbox without waiting on or
+  double-publishing each other's rows.
+
+| Exchange (type) | Routing key | Queue | Direction |
+| --- | --- | --- | --- |
+| `tasks` (topic) | `task.<type>` | `worker.tasks` | control plane -> worker |
+| `task-updates` (topic) | `task.update.<status>` | `controlplane.task-updates` | worker -> control plane |
+| `task-updates.dlx` (fanout) | any | `controlplane.task-updates.dlq` | rejected (poison) updates |
+
+All queues are durable quorum queues and all messages are persistent. `/readyz` reports
+ready only while both the database and the broker connection are up.
+
 ## Tech stack
 
 | Concern | Choice |
@@ -132,9 +186,12 @@ app/
     repository.py           all SQL
   messaging/              broker integration
     events.py               message formats
+    broker.py               RabbitMQ connection, topology, confirmed publishing
+    outbox_relay.py         background loop: outbox rows -> broker
   core/                   shared helpers with no business knowledge
     config.py               settings from environment variables
     clock.py                UTC millisecond timestamps
+    backoff.py              exponential backoff with jitter
     pagination.py           keyset cursors
 migrations/               SQL schema, applied at startup
 worker/                   worker simulator (separate process)
