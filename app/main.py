@@ -1,5 +1,7 @@
 """Application entry point: builds the FastAPI app and wires its dependencies."""
 
+import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -11,13 +13,18 @@ from app.api.openapi import install_openapi
 from app.api.routes import health, tasks, tenants
 from app.core.config import load_settings
 from app.db.database import Database, create_pool, run_migrations
+from app.messaging.broker import Broker
+from app.messaging.outbox_relay import OutboxRelay
 from app.services.task_service import TaskService
 from app.services.tenant_service import TenantService
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Startup: settings, database pool, migrations, services. Shutdown: close the pool."""
+    """Startup: settings, database, migrations, broker, outbox relay, services.
+
+    Shutdown runs in reverse: stop the relay, close the broker, close the pool.
+    """
     settings = load_settings()
     logging.basicConfig(
         level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -26,10 +33,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         await run_migrations(pool)
         db = Database(pool)
-        app.state.db = db
-        app.state.tenant_service = TenantService(db)
-        app.state.task_service = TaskService(db)
-        yield
+        broker = await Broker.connect(settings.rabbitmq_url)
+        relay = asyncio.create_task(OutboxRelay(db, broker).run(), name="outbox-relay")
+        try:
+            app.state.db = db
+            app.state.broker = broker
+            app.state.tenant_service = TenantService(db)
+            app.state.task_service = TaskService(db)
+            yield
+        finally:
+            relay.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await relay
+            await broker.close()
     finally:
         await pool.close()
 

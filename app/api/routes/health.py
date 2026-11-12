@@ -4,6 +4,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.db.database import Database
+from app.messaging.broker import Broker
 
 router = APIRouter(include_in_schema=False)
 
@@ -16,8 +17,10 @@ async def healthz() -> dict[str, str]:
 
 @router.get("/readyz")
 async def readyz(request: Request) -> JSONResponse:
-    """Readiness: dependencies are reachable."""
+    """Readiness: the database answers and the broker connection is up."""
     db: Database = request.app.state.db
-    if await db.ping():
-        return JSONResponse({"status": "ready"})
-    return JSONResponse({"status": "unavailable"}, status_code=503)
+    broker: Broker = request.app.state.broker
+    checks = {"database": await db.ping(), "broker": broker.is_connected}
+    if all(checks.values()):
+        return JSONResponse({"status": "ready", **checks})
+    return JSONResponse({"status": "unavailable", **checks}, status_code=503)

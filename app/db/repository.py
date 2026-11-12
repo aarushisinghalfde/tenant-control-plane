@@ -5,6 +5,7 @@ concurrency guarantees live here: unique constraints and conditional UPDATEs.
 """
 
 from collections.abc import Collection
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -13,6 +14,17 @@ import asyncpg
 
 from app.domain.errors import TenantAlreadyExistsError
 from app.domain.models import Task, TaskStatus, TaskType, Tenant, TenantStatus
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxEvent:
+    """An outbox row waiting to be published. `payload` is the JSON message body."""
+
+    id: int
+    event_id: UUID
+    routing_key: str
+    payload: str
+    attempts: int
 
 
 class Repository:
@@ -185,6 +197,49 @@ class Repository:
             event_id,
             routing_key,
             payload,
+        )
+
+    async def claim_outbox_batch(self, limit: int) -> list[OutboxEvent]:
+        """Lock up to `limit` unpublished events, oldest first.
+
+        FOR UPDATE holds the rows until this transaction ends, so no one else publishes
+        them meanwhile; SKIP LOCKED lets a second relay (another replica) take the next
+        rows instead of waiting. Only committed rows are visible here, which is what
+        makes "publish after commit" hold.
+        """
+        rows = await self._conn.fetch(
+            """
+            SELECT id, event_id, routing_key, payload::text AS payload, attempts
+            FROM outbox
+            WHERE published_at IS NULL
+            ORDER BY id
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+            """,
+            limit,
+        )
+        return [
+            OutboxEvent(
+                id=row["id"],
+                event_id=row["event_id"],
+                routing_key=row["routing_key"],
+                payload=row["payload"],
+                attempts=row["attempts"],
+            )
+            for row in rows
+        ]
+
+    async def mark_outbox_published(self, outbox_id: int, now: datetime) -> None:
+        await self._conn.execute(
+            "UPDATE outbox SET published_at = $2 WHERE id = $1",
+            outbox_id,
+            now,
+        )
+
+    async def record_outbox_failure(self, outbox_id: int) -> None:
+        await self._conn.execute(
+            "UPDATE outbox SET attempts = attempts + 1 WHERE id = $1",
+            outbox_id,
         )
 
 

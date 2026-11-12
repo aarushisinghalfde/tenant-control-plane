@@ -1,1 +1,1 @@
-"""Broker integration: message formats now; the outbox relay and consumer land here next."""
+"""Broker integration: message formats, RabbitMQ topology and the outbox relay."""
