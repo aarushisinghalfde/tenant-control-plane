@@ -5,15 +5,15 @@ Every combination is enumerated, so both allowed and forbidden transitions are c
 
 import pytest
 
-from app.domain import (
+from app.domain.errors import (
     TaskNotFoundError,
-    TaskStatus,
-    TaskType,
     TenantAlreadyExistsError,
     TenantNotFoundError,
-    TenantStatus,
     TenantUpdateNotAllowedError,
     TenantVersionConflictError,
+)
+from app.domain.models import TaskStatus, TaskType, TenantStatus
+from app.domain.rules import (
     can_apply_task_update,
     ensure_can_start,
     is_valid_slug,
@@ -57,6 +57,13 @@ ALLOWED_STARTS = {
     (TaskType.DESTROY, TenantStatus.ACTIVE),
     (TaskType.DESTROY, TenantStatus.FAILED),
 }
+
+
+def test_not_allowed_message_names_the_allowed_statuses() -> None:
+    with pytest.raises(TenantUpdateNotAllowedError) as caught:
+        ensure_can_start(TaskType.UPDATE, TenantStatus.PROVISIONING)
+    expected = "cannot update tenant in status provisioning; requires active"
+    assert caught.value.message == expected
 
 
 @pytest.mark.parametrize("tenant_status", list(TenantStatus))
@@ -136,4 +143,5 @@ def test_error_codes_match_the_api_contract() -> None:
 def test_version_conflict_carries_current_version() -> None:
     error = TenantVersionConflictError(current_version=3, requested_version=2)
     assert error.current_version == 3
-    assert error.message == "tenant version is 3, request had 2"
+    assert error.requested_version == 2
+    assert error.message == "version 2 is stale; current version is 3"

@@ -23,8 +23,12 @@ RUN pip install -r requirements.txt
 
 COPY --chown=app:app app ./app
 COPY --chown=app:app worker ./worker
+COPY --chown=app:app migrations ./migrations
 
 USER app
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 # ---- dev: adds test, lint and security tooling plus the full repo --------
 FROM base AS dev

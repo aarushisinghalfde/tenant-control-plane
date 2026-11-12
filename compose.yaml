@@ -1,6 +1,47 @@
 name: tenant-control-plane
 
+# Local-development credentials only; nothing in this file is a real secret.
+x-database-url: &database-url postgresql://tenants:tenants@postgres:5432/tenants
+
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tenants
+      POSTGRES_PASSWORD: tenants
+      POSTGRES_DB: tenants
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tenants -d tenants"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  control-plane:
+    image: tenant-control-plane:runtime
+    build:
+      context: .
+      target: runtime
+    environment:
+      DATABASE_URL: *database-url
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz', timeout=2)"
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
   # Single quality gate: format check, lint, type check, security scans
   # and the test suite.
   #   docker compose --profile tools run --rm --build check
@@ -23,3 +64,6 @@ services:
     volumes:
       - .:/srv
     command: ["sh", "-c", "ruff format . && ruff check --fix ."]
+
+volumes:
+  pgdata:

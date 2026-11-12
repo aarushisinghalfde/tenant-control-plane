@@ -1,46 +1,20 @@
-"""Domain rules: tenant and task state machines, and the errors the API exposes.
+"""The tenant and task state machines.
 
-Pure logic with no I/O, so every rule can be unit-tested in isolation. The database
-layer enforces the same rules with conditional UPDATEs, so a race cannot bypass them.
+Pure logic, so every rule is unit-tested in isolation. The repository enforces the
+same rules with conditional UPDATEs, so a race cannot bypass them.
 """
-
-from __future__ import annotations
 
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import StrEnum
 from types import MappingProxyType
-from typing import ClassVar, Final
+from typing import Final
+
+from app.domain.errors import TenantUpdateNotAllowedError
+from app.domain.models import TaskStatus, TaskType, TenantStatus
 
 # k8s-namespace compatible, 3-28 characters (the pattern itself bounds the length).
 SLUG_PATTERN: Final = re.compile(r"^[a-z][-a-z0-9]{1,26}[a-z0-9]$")
-
-
-class TenantStatus(StrEnum):
-    PROVISIONING = "provisioning"
-    ACTIVE = "active"
-    UPDATING = "updating"
-    DESTROYING = "destroying"
-    DESTROYED = "destroyed"
-    FAILED = "failed"
-
-
-class TaskType(StrEnum):
-    DEPLOY = "deploy"
-    UPDATE = "update"
-    DESTROY = "destroy"
-
-
-class TaskStatus(StrEnum):
-    ACCEPTED = "accepted"
-    IN_PROGRESS = "in_progress"
-    DONE = "done"
-    FAILED = "failed"
-
-    @property
-    def is_terminal(self) -> bool:
-        return self in (TaskStatus.DONE, TaskStatus.FAILED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,10 +73,15 @@ def is_valid_slug(slug: str) -> bool:
 
 def ensure_can_start(task_type: TaskType, tenant_status: TenantStatus) -> None:
     """Raise if the API may not start `task_type` on a tenant in `tenant_status`."""
-    if tenant_status not in TASK_RULES[task_type].allowed_from:
-        raise TenantUpdateNotAllowedError(
-            f"cannot start a {task_type} task while the tenant is {tenant_status}"
-        )
+    allowed_from = TASK_RULES[task_type].allowed_from
+    if tenant_status in allowed_from:
+        return
+    if not allowed_from:
+        raise TenantUpdateNotAllowedError(f"{task_type} runs only for new tenants")
+    allowed = " or ".join(sorted(allowed_from))
+    raise TenantUpdateNotAllowedError(
+        f"cannot {task_type} tenant in status {tenant_status}; requires {allowed}"
+    )
 
 
 def can_apply_task_update(current: TaskStatus, new: TaskStatus) -> bool:
@@ -123,40 +102,3 @@ def tenant_status_after(task_type: TaskType, outcome: TaskStatus) -> TenantStatu
     if outcome is TaskStatus.FAILED:
         return TenantStatus.FAILED
     return TASK_RULES[task_type].on_done
-
-
-class DomainError(Exception):
-    """Base for errors the API turns into a structured response.
-
-    `code` is part of the public API contract: clients branch on it.
-    """
-
-    code: ClassVar[str]
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.message = message
-
-
-class TenantNotFoundError(DomainError):
-    code = "tenant_not_found"
-
-
-class TenantAlreadyExistsError(DomainError):
-    code = "tenant_already_exists"
-
-
-class TenantUpdateNotAllowedError(DomainError):
-    code = "tenant_update_not_allowed"
-
-
-class TenantVersionConflictError(DomainError):
-    code = "tenant_version_conflict"
-
-    def __init__(self, current_version: int, requested_version: int) -> None:
-        super().__init__(f"tenant version is {current_version}, request had {requested_version}")
-        self.current_version = current_version
-
-
-class TaskNotFoundError(DomainError):
-    code = "task_not_found"
