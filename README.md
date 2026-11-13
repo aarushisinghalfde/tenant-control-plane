@@ -15,6 +15,8 @@ provisioning work, and reports progress back over the broker.
 | [Broker outage](docs/evidence/outbox-broker-outage.md) | Writes succeed while RabbitMQ is down; the event is published once it returns |
 | [Rejected writes](docs/evidence/rejected-writes.md) | Duplicate slugs, stale versions and invalid transitions are refused and publish nothing |
 | [Worker simulator](docs/evidence/worker-simulator.md) | The worker drains queued tasks and reports `in_progress` then an outcome for each |
+| [Full lifecycle](docs/evidence/full-lifecycle.md) | Queued updates applied exactly once; a tenant goes from create to destroyed with no manual step |
+| [Test suite](docs/evidence/test-suite.md) | The single test command, all green: quality gates, unit tests, integration tests against the real stack |
 | <http://localhost:8000/docs> | Interactive API reference (after boot), generated from the code |
 
 ## Prerequisites
@@ -64,6 +66,11 @@ curl -s -X PATCH localhost:8000/v1/tenants/<id> \
 # A tenant's tasks
 curl -s localhost:8000/v1/tenants/<id>/tasks
 ```
+
+Prefer clicking to typing? Open [`requests.http`](requests.http) in VS Code with the
+REST Client extension: it walks create -> get -> tasks -> update -> delete and every error
+code, carrying ids and versions from one response to the next. The interactive docs at
+<http://localhost:8000/docs> do the same in a browser.
 
 ## API
 
@@ -216,6 +223,36 @@ docker compose up -d worker
 
 `docker compose logs -f worker` shows each task and every update it sends.
 
+## Testing
+
+```bash
+docker compose up --build -d --wait                     # boot
+docker compose --profile tools run --rm --build check   # the full suite
+```
+
+`check` runs, in order, and stops at the first failure: format check, lint, strict type
+check, a code security scan (bandit), a dependency vulnerability scan (pip-audit), the
+unit and API contract tests, and the integration tests. With `--build` it also rebuilds
+the application image and recreates the control plane and worker if the code changed, so
+the integration tests always run against the current code; it starts the stack if it is
+not running.
+
+| Suite | Runs against | Covers |
+| --- | --- | --- |
+| `tests/unit` | Pure Python, fakes | Every tenant and task state transition, worker settings and simulation plan, outbox relay and consumer decisions (ack, retry, dead-letter), message formats, timestamps, cursors |
+| `tests/api` | The HTTP app with faked services | Status codes, the error body and every error code, validation, OpenAPI document |
+| `tests/integration` | The real stack: API, PostgreSQL, RabbitMQ, worker | Full lifecycle with no manual step; failed deploy then destroy; destroyed slugs stay taken; 20 parallel creates with one slug, 50 parallel PATCHes with one version and 10 parallel DELETEs each have exactly one winner and leave nothing behind; one published event per task; rejected writes publish nothing; duplicate updates change state once; a late `in_progress` never regresses `done`; poison messages go to the dead-letter queue while the consumer keeps going |
+
+The integration tests publish hand-made updates straight to RabbitMQ where they need exact
+control over order and duplication, so they do not depend on the worker's random timing.
+Run outside the compose network (plain `pytest`), they are skipped with a message saying how
+to run them.
+
+Two behaviours are shown by manual runs rather than automated tests, because they need the
+broker or the control plane stopped mid-test: a write while RabbitMQ is down is published once
+it returns ([evidence](docs/evidence/outbox-broker-outage.md)), and data survives restarts
+(the same tenants persist across every rebuild in the [evidence pages](docs/evidence/README.md)).
+
 ## Tech stack
 
 | Concern | Choice |
@@ -269,7 +306,9 @@ worker/                   worker simulator (separate process)
   simulation.py             decides outcome, order, duplicates and delays (pure)
   config.py                 flags and their environment-variable twins
 tests/
-  unit/                   rules, helpers, schemas, events
+  unit/                   rules, helpers, schemas, events, relay, consumer, worker
   api/                    HTTP contract with faked services
+  integration/            end to end against the running stack
+requests.http             click-through API tour (VS Code REST Client)
 scripts/                  quality-gate script
 ```

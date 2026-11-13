@@ -1,0 +1,80 @@
+# Click-through tour of the API.
+#
+# VS Code: install the "REST Client" extension (humao.rest-client), boot the stack
+# (docker compose up --build -d --wait), then click "Send Request" above each request,
+# top to bottom. Later requests reuse ids and versions from earlier responses, so
+# nothing needs copying. Give the worker a few seconds between steps 1 and 2.
+
+@baseUrl = http://localhost:8000
+
+### 1. Create a tenant: 202, tenant "provisioning", task "deploy" / "accepted"
+# @name create
+POST {{baseUrl}}/v1/tenants
+Content-Type: application/json
+
+{"slug": "demo-{{$randomInt 100000 999999}}", "name": "Demo Corp"}
+
+### 2. Get it: "active" at version 2 once the worker has deployed it
+# @name get
+GET {{baseUrl}}/v1/tenants/{{create.response.body.$.tenant.id}}
+
+### 3. Its tasks, newest first
+GET {{baseUrl}}/v1/tenants/{{create.response.body.$.tenant.id}}/tasks
+
+### 4. The deploy task on its own
+GET {{baseUrl}}/v1/tasks/{{create.response.body.$.task.id}}
+
+### 5. Rename it, passing the version from step 2: 202, "updating"
+# @name update
+PATCH {{baseUrl}}/v1/tenants/{{create.response.body.$.tenant.id}}
+Content-Type: application/json
+
+{"name": "Demo Corp Renamed", "version": {{get.response.body.$.version}}}
+
+### 6. Same PATCH again with the old version: 409 tenant_version_conflict
+PATCH {{baseUrl}}/v1/tenants/{{create.response.body.$.tenant.id}}
+Content-Type: application/json
+
+{"name": "Lost Update", "version": {{get.response.body.$.version}}}
+
+### 7. Delete it (re-run step 2 first until it is "active" again): 202, "destroying"
+DELETE {{baseUrl}}/v1/tenants/{{create.response.body.$.tenant.id}}
+
+### 8. Its slug stays taken, even once destroyed: 409 tenant_already_exists
+POST {{baseUrl}}/v1/tenants
+Content-Type: application/json
+
+{"slug": "{{create.response.body.$.tenant.slug}}", "name": "Copycat"}
+
+### --- Listing, filtering and paging -----------------------------------------------
+
+### Active tenants, two per page; pass "next_cursor" as ?cursor= for the next page
+GET {{baseUrl}}/v1/tenants?status=active&limit=2
+
+### Failed tasks of any tenant
+GET {{baseUrl}}/v1/tasks?status=failed
+
+### Destroy tasks of the tenant from step 1
+GET {{baseUrl}}/v1/tasks?tenant_id={{create.response.body.$.tenant.id}}&type=destroy
+
+### --- Errors: every one has the same {"error": {"code", "message", "details"}} shape ---
+
+### 400 validation_failed: slug breaks the pattern, name is blank
+POST {{baseUrl}}/v1/tenants
+Content-Type: application/json
+
+{"slug": "Not A Slug", "name": ""}
+
+### 404 tenant_not_found
+GET {{baseUrl}}/v1/tenants/00000000-0000-0000-0000-000000000000
+
+### 404 task_not_found
+GET {{baseUrl}}/v1/tasks/00000000-0000-0000-0000-000000000000
+
+### 400 validation_failed: limit out of range
+GET {{baseUrl}}/v1/tenants?limit=500
+
+### --- Health ----------------------------------------------------------------------
+
+### Readiness: database and broker both reachable
+GET {{baseUrl}}/readyz

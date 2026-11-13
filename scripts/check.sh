@@ -21,7 +21,10 @@ bandit -q -c pyproject.toml -r app worker
 step "Security: dependencies (pip-audit)"
 pip-audit
 
-step "Tests (pytest)"
-pytest
+step "Tests: unit and API contract (pytest)"
+pytest --ignore=tests/integration
+
+step "Tests: integration, against the running stack (pytest)"
+pytest tests/integration
 
 printf '\nAll checks passed.\n'

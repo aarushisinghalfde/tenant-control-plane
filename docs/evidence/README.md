@@ -10,3 +10,4 @@ They complement the automated test suite, which remains the primary proof.
 | [rejected-writes.md](rejected-writes.md) | Duplicate slugs, stale versions and invalid transitions are refused with structured errors and publish nothing |
 | [worker-simulator.md](worker-simulator.md) | The worker drains queued tasks and publishes two updates per task, acknowledging only after they are confirmed |
 | [full-lifecycle.md](full-lifecycle.md) | The consumer applies queued updates exactly once (duplicates and stale updates ignored), and a tenant walks create -> active -> update -> delete -> destroyed by itself |
+| [test-suite.md](test-suite.md) | The single test command: all quality gates, 193 unit and contract tests, and 12 integration tests against the real stack |
