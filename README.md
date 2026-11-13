@@ -38,7 +38,7 @@ The API is then on <http://localhost:8000>, with interactive docs at
 | Purpose | Command |
 | --- | --- |
 | Boot the stack | `docker compose up --build -d --wait` |
-| Follow logs | `docker compose logs -f control-plane` |
+| Follow logs | `docker compose logs -f control-plane worker` |
 | Stop (keep data) | `docker compose down` |
 | Stop and delete all data | `docker compose down -v` |
 | Quality gate (format, lint, types, security, tests) | `docker compose --profile tools run --rm --build check` |
@@ -148,6 +148,59 @@ sequenceDiagram
 All queues are durable quorum queues and all messages are persistent. `/readyz` reports
 ready only while both the database and the broker connection are up.
 
+## Worker simulator
+
+A separate process (`worker/`, compose service `worker`) that plays the provisioning
+side. For each task on `worker.tasks` it waits, publishes `in_progress`, waits, publishes
+`done` or `failed` to the `task-updates` exchange, and only then acknowledges the task.
+
+Each update carries its own idempotency key and names the task and tenant it is about:
+
+```json
+{
+  "schema_version": 1,
+  "message_id": "6f1c1c1e-9a43-5b0e-8e4a-0d9f3c2b7a11",
+  "task_id": "12abc171-5933-4777-bb38-00ddb65b5ec1",
+  "tenant_id": "13adfc44-c323-4124-a4cf-b9ba3a68c3a9",
+  "status": "failed",
+  "error": "simulated provisioning failure",
+  "occurred_at": "2026-11-13T10:00:01.456Z"
+}
+```
+
+`message_id` is derived from the task id and the status (UUIDv5), so if the worker dies
+half-way and the broker redelivers the task, the repeated updates carry the same ids and
+the control plane recognises them as duplicates.
+
+| Flag | Environment variable | Default | Effect |
+| --- | --- | --- | --- |
+| `--fail-rate` | `WORKER_FAIL_RATE` | `0` | Chance (0-1) that a task ends `failed` |
+| `--min-delay-ms` / `--max-delay-ms` | `WORKER_MIN_DELAY_MS` / `WORKER_MAX_DELAY_MS` | `500` / `2000` | Random wait before each update |
+| `--duplicate-rate` | `WORKER_DUPLICATE_RATE` | `0` | Chance (0-1) that each update is sent twice, byte for byte |
+| `--reorder` | `WORKER_REORDER` | `false` | Send the outcome first, then a stale `in_progress` |
+| `--seed` | `WORKER_SEED` | random | Fix the random choices for a repeatable run |
+| `--concurrency` | `WORKER_CONCURRENCY` | `4` | Tasks handled at once |
+
+A flag wins over its variable. Change the scenario by restarting the worker:
+
+```bash
+# bash (macOS, Linux)
+WORKER_FAIL_RATE=1 docker compose up -d worker            # every task fails
+docker compose stop worker                                # or: one-off run with flags
+docker compose run --rm worker --duplicate-rate=1 --reorder
+docker compose up -d worker                               # back to defaults
+```
+
+```powershell
+# PowerShell (Windows)
+$env:WORKER_FAIL_RATE = "1"; docker compose up -d worker; Remove-Item Env:WORKER_FAIL_RATE
+docker compose stop worker
+docker compose run --rm worker --duplicate-rate=1 --reorder
+docker compose up -d worker
+```
+
+`docker compose logs -f worker` shows each task and every update it sends.
+
 ## Tech stack
 
 | Concern | Choice |
@@ -195,6 +248,9 @@ app/
     pagination.py           keyset cursors
 migrations/               SQL schema, applied at startup
 worker/                   worker simulator (separate process)
+  main.py                   consumes worker.tasks, publishes updates, acks last
+  simulation.py             decides outcome, order, duplicates and delays (pure)
+  config.py                 flags and their environment-variable twins
 tests/
   unit/                   rules, helpers, schemas, events
   api/                    HTTP contract with faked services

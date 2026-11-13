@@ -2,7 +2,7 @@
 
 How the code is organised, how the classes connect, and what happens step by step
 when a tenant is created. Covers what is built so far (API, database, outbox relay,
-RabbitMQ); parts arriving in later phases are marked *planned*.
+RabbitMQ, worker simulator); the update consumer, arriving in phase 7, is marked *planned*.
 
 ## Layers
 
@@ -43,12 +43,12 @@ flowchart TD
 
     postgres[(PostgreSQL<br/>tenants, tasks, outbox,<br/>processed_messages)]
     rabbitmq[(RabbitMQ)]
-    worker["Worker simulator<br/>(planned, phase 6)"]
+    worker["Worker simulator<br/>worker/main.py"]
 
     client --> routes
     routes --> tenant_service
     routes --> task_service
-    routes -. raises .-> handlers
+    routes -.->|raises| handlers
     tenant_service --> rules
     tenant_service --> event
     tenant_service --> database
@@ -62,13 +62,13 @@ flowchart TD
     broker --> rabbitmq
     health --> database
     health --> broker
-    rabbitmq -. worker.tasks .-> worker
-    worker -. task-updates .-> rabbitmq
-    rabbitmq -. controlplane.task-updates .-> consumer
+    rabbitmq -->|worker.tasks| worker
+    worker -->|task-updates| rabbitmq
+    rabbitmq -.->|controlplane.task-updates| consumer
     consumer -.-> database
 
     classDef planned stroke-dasharray: 5 5
-    class consumer,worker planned
+    class consumer planned
 ```
 
 `app/main.py` wires it all together at startup (the `lifespan` function); `app/core`
@@ -106,7 +106,7 @@ sequenceDiagram
     participant S as TenantService
     participant DB as Database / Repository
     participant PG as PostgreSQL
-    participant OR as OutboxRelay
+    participant RL as OutboxRelay
     participant B as Broker
     participant MQ as RabbitMQ
 
@@ -124,11 +124,11 @@ sequenceDiagram
     R-->>C: 202 {tenant, task} + Location
 
     loop every 200 ms
-        OR->>PG: SELECT unpublished ... FOR UPDATE SKIP LOCKED
-        OR->>B: publish_task(message_id = task id)
+        RL->>PG: SELECT unpublished ... FOR UPDATE SKIP LOCKED
+        RL->>B: publish_task(message_id = task id)
         B->>MQ: publish to "tasks", key task.deploy
         MQ-->>B: confirm
-        OR->>PG: SET published_at, COMMIT
+        RL->>PG: SET published_at, COMMIT
     end
     Note over MQ: message waits in worker.tasks
 ```
@@ -153,9 +153,12 @@ If it matches no row, `_explain_rejection()` reads the tenant to raise the right
 (`tenant_not_found`, `tenant_version_conflict` or `tenant_update_not_allowed`) and the
 transaction rolls back, so no task or outbox row is written.
 
-## Planned: closing the loop (phases 6-7)
+## The worker simulator (phase 6)
 
-12. The **worker simulator** consumes `worker.tasks`, waits, and publishes `in_progress` and then `done` or `failed` to the `task-updates` exchange, each update with its own `message_id`.
+12. The **worker** (`worker/main.py`, class `Worker`) consumes `worker.tasks`, at most `--concurrency` tasks at a time. For each it asks `plan_steps()` (`worker/simulation.py`) what to send: `in_progress` then `done`, or `failed` with probability `--fail-rate`, optionally reordered or duplicated. It publishes each `TaskUpdate` to the `task-updates` exchange with publisher confirms, and acknowledges the task only after the last update is confirmed. A malformed task is rejected without requeue; if the broker fails mid-task, the task is requeued and redone, and because each `message_id` is `uuid5(task id, status)`, the repeats look like duplicates to the consumer. Until phase 7 the updates wait in `controlplane.task-updates`.
+
+## Planned: applying updates (phase 7)
+
 13. The **update consumer** in the control plane reads `controlplane.task-updates`. In one transaction it records the `message_id` in `processed_messages` (a duplicate is skipped), checks `can_apply_task_update()` so a stale update cannot move the task backwards, updates the task, and on a terminal outcome moves the tenant (`tenant_status_after()`) and bumps its version. It acknowledges the message only after commit; a malformed message is rejected into the dead-letter queue.
 
 ## Related documents

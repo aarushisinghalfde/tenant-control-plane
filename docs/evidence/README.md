@@ -8,3 +8,4 @@ They complement the automated test suite, which remains the primary proof.
 | --- | --- |
 | [outbox-broker-outage.md](outbox-broker-outage.md) | Writes succeed while RabbitMQ is down; the event is published once it returns; nothing is lost |
 | [rejected-writes.md](rejected-writes.md) | Duplicate slugs, stale versions and invalid transitions are refused with structured errors and publish nothing |
+| [worker-simulator.md](worker-simulator.md) | The worker drains queued tasks and publishes two updates per task, acknowledging only after they are confirmed |

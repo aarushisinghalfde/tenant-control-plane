@@ -13,13 +13,19 @@ queued is lost when the broker restarts.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final
 from uuid import UUID
 
 import aio_pika
 from aio_pika import DeliveryMode, ExchangeType
-from aio_pika.abc import AbstractChannel, AbstractExchange, AbstractRobustConnection
+from aio_pika.abc import (
+    AbstractChannel,
+    AbstractExchange,
+    AbstractIncomingMessage,
+    AbstractRobustConnection,
+)
 
 TASKS_EXCHANGE: Final = "tasks"
 WORKER_TASKS_QUEUE: Final = "worker.tasks"
@@ -71,8 +77,15 @@ async def declare_topology(channel: AbstractChannel) -> Exchanges:
     return Exchanges(tasks=tasks, task_updates=task_updates)
 
 
+MessageHandler = Callable[[AbstractIncomingMessage], Awaitable[None]]
+
+
 class Broker:
-    """The control plane's link to RabbitMQ: one self-healing connection, one channel."""
+    """One process's link to RabbitMQ: a self-healing connection and a publishing channel.
+
+    The control plane uses it to publish tasks (and, from phase 7, to consume updates);
+    the worker uses it to consume tasks and publish updates.
+    """
 
     def __init__(self, connection: AbstractRobustConnection, exchanges: Exchanges) -> None:
         self._connection = connection
@@ -101,19 +114,39 @@ class Broker:
         return not self._connection.is_closed and self._connection.connected.is_set()
 
     async def publish_task(self, *, message_id: UUID, routing_key: str, body: bytes) -> None:
-        """Publish one task event; returns only once the broker has confirmed it.
+        """Publish one task event to the worker; returns once the broker has confirmed it.
 
         Raises one of PUBLISH_ERRORS if the broker is unreachable or refuses the message.
         """
-        message = aio_pika.Message(
-            body,
-            message_id=str(message_id),  # = task id; lets consumers drop duplicates
-            content_type="application/json",
-            delivery_mode=DeliveryMode.PERSISTENT,
-        )
-        await self._exchanges.tasks.publish(
-            message, routing_key=routing_key, timeout=PUBLISH_TIMEOUT_SECONDS
-        )
+        await _publish(self._exchanges.tasks, message_id, routing_key, body)
+
+    async def publish_update(self, *, message_id: UUID, routing_key: str, body: bytes) -> None:
+        """Publish one task update to the control plane; same guarantees as publish_task."""
+        await _publish(self._exchanges.task_updates, message_id, routing_key, body)
+
+    async def consume(self, queue_name: str, handler: MessageHandler, *, prefetch: int) -> None:
+        """Start delivering messages from `queue_name` to `handler`, then return.
+
+        The broker hands out at most `prefetch` unacknowledged messages at a time, each in
+        its own asyncio task. The handler must ack, nack or reject every message itself.
+        Consumption resumes on its own after a reconnect.
+        """
+        channel = await self._connection.channel()
+        await channel.set_qos(prefetch_count=prefetch)
+        queue = await channel.get_queue(queue_name)
+        await queue.consume(handler)
 
     async def close(self) -> None:
         await self._connection.close()
+
+
+async def _publish(
+    exchange: AbstractExchange, message_id: UUID, routing_key: str, body: bytes
+) -> None:
+    message = aio_pika.Message(
+        body,
+        message_id=str(message_id),  # lets consumers drop duplicates
+        content_type="application/json",
+        delivery_mode=DeliveryMode.PERSISTENT,
+    )
+    await exchange.publish(message, routing_key=routing_key, timeout=PUBLISH_TIMEOUT_SECONDS)

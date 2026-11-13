@@ -65,6 +65,32 @@ services:
       retries: 20
       start_period: 5s
 
+  # Worker simulator. Scenarios via environment variables, for example in PowerShell:
+  #   $env:WORKER_FAIL_RATE=1; docker compose up -d worker
+  # or via flags on a one-off run:
+  #   docker compose stop worker
+  #   docker compose run --rm worker --fail-rate=1 --duplicate-rate=0.5 --reorder
+  worker:
+    image: tenant-control-plane:runtime
+    build:
+      context: .
+      target: runtime
+    entrypoint: ["python", "-m", "worker.main"]
+    environment:
+      RABBITMQ_URL: *rabbitmq-url
+      WORKER_FAIL_RATE: ${WORKER_FAIL_RATE:-0}
+      WORKER_MIN_DELAY_MS: ${WORKER_MIN_DELAY_MS:-500}
+      WORKER_MAX_DELAY_MS: ${WORKER_MAX_DELAY_MS:-2000}
+      WORKER_DUPLICATE_RATE: ${WORKER_DUPLICATE_RATE:-0}
+      WORKER_REORDER: ${WORKER_REORDER:-false}
+      WORKER_SEED: ${WORKER_SEED:-}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      LOG_LEVEL: INFO
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: on-failure
+
   # Single quality gate: format check, lint, type check, security scans
   # and the test suite.
   #   docker compose --profile tools run --rm --build check
