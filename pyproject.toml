@@ -31,11 +31,12 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["ARG"]  # pytest fixtures are often requested only for their side effects
+"scripts/**" = ["T20"]  # command-line tools print their results
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["app", "worker", "tests"]
+files = ["app", "worker", "tests", "scripts"]
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]

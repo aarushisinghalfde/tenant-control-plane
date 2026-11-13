@@ -45,13 +45,25 @@ def _version_detail(current: int) -> dict[str, str]:
     }
 
 
-# One realistic body per code, shown as the example in the Swagger docs.
-_EXAMPLES: Mapping[str, dict[str, Any]] = {
-    ValidationFailedError.code: {
+# 400 `validation_failed` can come from the body or from the query or path, so the docs
+# show one example of each.
+_VALIDATION_EXAMPLES: Mapping[str, dict[str, Any]] = {
+    "invalid body field": {
         "code": "validation_failed",
         "message": "request is invalid",
         "details": [{"field": "body.slug", "message": SLUG_RULE}],
     },
+    "invalid query or path parameter": {
+        "code": "validation_failed",
+        "message": "request is invalid",
+        "details": [
+            {"field": "query.limit", "message": "Input should be less than or equal to 200"}
+        ],
+    },
+}
+
+# One realistic body per code, shown as the example in the Swagger docs.
+_EXAMPLES: Mapping[str, dict[str, Any]] = {
     TenantNotFoundError.code: {
         "code": "tenant_not_found",
         "message": "tenant 3fa85f64-5717-4562-b3fc-2c963f66afa6 not found",
@@ -76,6 +88,13 @@ _EXAMPLES: Mapping[str, dict[str, Any]] = {
 }
 
 
+def _examples_for(error: type[DomainError]) -> dict[str, Any]:
+    """Named Swagger examples for one error code."""
+    if error is ValidationFailedError:
+        return {name: {"value": {"error": body}} for name, body in _VALIDATION_EXAMPLES.items()}
+    return {error.code: {"value": {"error": _EXAMPLES[error.code]}}}
+
+
 def error_responses(*errors: type[DomainError]) -> dict[int | str, dict[str, Any]]:
     """OpenAPI `responses` for the errors a route can return, grouped by HTTP status.
 
@@ -86,7 +105,9 @@ def error_responses(*errors: type[DomainError]) -> dict[int | str, dict[str, Any
         by_status.setdefault(HTTP_STATUS[error], []).append(error)
     responses: dict[int | str, dict[str, Any]] = {}
     for status, group in by_status.items():
-        examples = {error.code: {"value": {"error": _EXAMPLES[error.code]}} for error in group}
+        examples: dict[str, Any] = {}
+        for error in group:
+            examples.update(_examples_for(error))
         responses[status] = {
             "model": ErrorResponse,
             "description": " or ".join(f"`{error.code}`" for error in group),

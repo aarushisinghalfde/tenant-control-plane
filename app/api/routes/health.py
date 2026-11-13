@@ -1,12 +1,18 @@
-"""Liveness and readiness probes (used by the container health check)."""
+"""Liveness and readiness probes (used by the container health check), and the root URL."""
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.db.database import Database
 from app.messaging.broker import Broker
 
 router = APIRouter(include_in_schema=False)
+
+
+@router.get("/")
+async def root() -> RedirectResponse:
+    """Someone opening the bare address in a browser lands on the interactive docs."""
+    return RedirectResponse("/docs")
 
 
 @router.get("/healthz")

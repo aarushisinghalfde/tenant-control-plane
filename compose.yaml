@@ -111,6 +111,23 @@ services:
         condition: service_started
     command: ["sh", "scripts/check.sh"]
 
+  # Publishes hand-made task updates straight to RabbitMQ (duplicate, stale, poison, ...).
+  #   docker compose --profile tools run --rm publish --help
+  #   docker compose --profile tools run --rm publish duplicate <task-id>
+  publish:
+    image: tenant-control-plane:dev
+    build:
+      context: .
+      target: dev
+    profiles: ["tools"]
+    environment:
+      API_URL: http://control-plane:8000
+      RABBITMQ_URL: *rabbitmq-url
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    entrypoint: ["python", "-m", "scripts.publish_update"]
+
   # Formats and auto-fixes the code in place on your machine.
   #   docker compose --profile tools run --rm --build fmt
   fmt:

@@ -1,76 +1,184 @@
 # Tenant Control Plane
 
+[![check](https://github.com/aarushisinghalfde/tenant-control-plane/actions/workflows/check.yml/badge.svg)](https://github.com/aarushisinghalfde/tenant-control-plane/actions/workflows/check.yml)
+
 An asynchronous tenant provisioning control plane. The HTTP API records tenants and their
-provisioning tasks in PostgreSQL; a worker picks the tasks up from RabbitMQ, simulates the
-provisioning work, and reports progress back over the broker.
+tasks in PostgreSQL and publishes each task to RabbitMQ only after the write commits; a
+separate worker simulator carries the task out and reports progress back over the broker;
+the control plane applies that progress idempotently and in a forward-only way.
 
-> Work in progress: sections are filled in as each part of the system lands.
-
-## Documentation
-
-| Document | Contents |
-| --- | --- |
-| [docs/architecture.md](docs/architecture.md) | Layers and class diagram, startup sequence, step-by-step lifecycle of a request through the outbox to RabbitMQ |
-| [docs/evidence/](docs/evidence/README.md) | Manual runs against the real stack, with commands, output and screenshots |
-| [Broker outage](docs/evidence/outbox-broker-outage.md) | Writes succeed while RabbitMQ is down; the event is published once it returns |
-| [Rejected writes](docs/evidence/rejected-writes.md) | Duplicate slugs, stale versions and invalid transitions are refused and publish nothing |
-| [Worker simulator](docs/evidence/worker-simulator.md) | The worker drains queued tasks and reports `in_progress` then an outcome for each |
-| [Full lifecycle](docs/evidence/full-lifecycle.md) | Queued updates applied exactly once; a tenant goes from create to destroyed with no manual step |
-| [Test suite](docs/evidence/test-suite.md) | The single test command, all green: quality gates, unit tests, integration tests against the real stack |
-| <http://localhost:8000/docs> | Interactive API reference (after boot), generated from the code |
-
-## Prerequisites
-
-- Git
-- Docker with Compose v2 (Docker Desktop on Windows and macOS)
-
-Nothing else. Python, PostgreSQL and RabbitMQ all run in containers.
-
-## Quick start
-
-```bash
-git clone https://github.com/aarushisinghalfde/tenant-control-plane.git && cd tenant-control-plane
-docker compose up --build -d --wait                       # build and boot everything
-docker compose --profile tools run --rm --build check     # quality gate + tests
+```mermaid
+flowchart LR
+    client([Client]) -->|HTTP| api[Control plane<br/>FastAPI]
+    api -->|one transaction:<br/>tenant, task, outbox row| pg[(PostgreSQL)]
+    pg -->|outbox relay| mq[(RabbitMQ)]
+    mq -->|worker.tasks| worker[Worker simulator]
+    worker -->|task-updates| mq
+    mq -->|controlplane.task-updates| consumer[Update consumer<br/>in the control plane]
+    consumer -->|dedupe, forward-only,<br/>tenant status + version| pg
 ```
 
-The API is then on <http://localhost:8000>, with interactive docs at
-<http://localhost:8000/docs>. The RabbitMQ management UI is on <http://localhost:15672>
-(user `tenants`, password `tenants`; local-development credentials only).
+**Contents:** [Reviewer guide](#reviewer-guide) ·
+[Design decisions and trade-offs](#design-decisions-and-trade-offs) · [API](#api) ·
+[Messaging](#messaging) · [Worker simulator](#worker-simulator) · [Testing](#testing) ·
+[Inspecting the system](#inspecting-the-system) · [Documentation](#documentation) ·
+[Project layout](#project-layout) · [What I would do next](#what-i-would-do-next)
 
-| Purpose | Command |
-| --- | --- |
-| Boot the stack | `docker compose up --build -d --wait` |
-| Follow logs | `docker compose logs -f control-plane worker` |
-| Stop (keep data) | `docker compose down` |
-| Stop and delete all data | `docker compose down -v` |
-| Quality gate (format, lint, types, security, tests) | `docker compose --profile tools run --rm --build check` |
-| Format and auto-fix the code in place | `docker compose --profile tools run --rm --build fmt` |
+## Reviewer guide
 
-## Try it
+About 15 minutes. You need **Git** and **Docker with Compose v2** (Docker Desktop on
+Windows and macOS); everything else runs in containers. Commands work unchanged in bash
+and PowerShell unless shown twice.
+
+### 1. Boot and test
 
 ```bash
-# Create a tenant: 202 Accepted, returns the tenant and its deploy task
-curl -s -X POST localhost:8000/v1/tenants \
-  -H 'Content-Type: application/json' \
+git clone https://github.com/aarushisinghalfde/tenant-control-plane.git
+cd tenant-control-plane
+docker compose up --build -d --wait                       # boot: PostgreSQL, RabbitMQ, API, worker
+docker compose --profile tools run --rm --build check     # test: the full suite
+```
+
+The test command ends with `All checks passed.` after: format check, lint, strict types,
+two security scans, ~200 unit and API contract tests, and 12 integration tests against
+the running stack (about a minute). See [Testing](#testing) for what they cover.
+
+| Open in a browser | What it is |
+| --- | --- |
+| <http://localhost:8000> | Interactive API docs (Swagger UI): make every call from the browser |
+| <http://localhost:15672> | RabbitMQ dashboard, user `tenants`, password `tenants` (local-development only) |
+
+### 2. Create a tenant and watch it go live (no manual steps)
+
+In the API docs at <http://localhost:8000>:
+
+1. **POST /v1/tenants** → **Try it out** → **Execute** (the example body is ready to send).
+   Response `202`: the tenant is `provisioning` (version 1) with a `deploy` task `accepted`.
+   Copy `tenant.id`.
+2. **GET /v1/tenants/{tenant_id}** → **Try it out** → paste the id → **Execute**. Within a
+   few seconds and a click or two it becomes `active` at version 2: the worker did the deploy.
+3. **GET /v1/tenants/{tenant_id}/tasks**: its `deploy` task is now `done` (it went
+   `accepted` → `in_progress` → `done`; the worker logs show each step).
+
+Execute step 1 again unchanged: `409 tenant_already_exists`, as the slug is taken.
+
+From a terminal instead (bash):
+
+```bash
+curl -s -X POST localhost:8000/v1/tenants -H 'Content-Type: application/json' \
   -d '{"slug": "acme-corp", "name": "Acme Corp"}'
-
-# List tenants (newest first, paginated with ?limit= and ?cursor=)
-curl -s localhost:8000/v1/tenants
-
-# Update the name; `version` must match the tenant's current version
-curl -s -X PATCH localhost:8000/v1/tenants/<id> \
-  -H 'Content-Type: application/json' \
-  -d '{"name": "Acme Corporation", "version": 1}'
-
-# A tenant's tasks
-curl -s localhost:8000/v1/tenants/<id>/tasks
+curl -s localhost:8000/v1/tenants/<tenant-id>
 ```
 
-Prefer clicking to typing? Open [`requests.http`](requests.http) in VS Code with the
-REST Client extension: it walks create -> get -> tasks -> update -> delete and every error
-code, carrying ids and versions from one response to the next. The interactive docs at
-<http://localhost:8000/docs> do the same in a browser.
+PowerShell:
+
+```powershell
+$t = (Invoke-RestMethod -Method Post -Uri http://localhost:8000/v1/tenants `
+  -ContentType 'application/json' -Body '{"slug":"acme-corp","name":"Acme Corp"}').tenant
+Invoke-RestMethod http://localhost:8000/v1/tenants/$($t.id)
+```
+
+### 3. Watch the messages
+
+In the RabbitMQ dashboard, **Queues and Streams**:
+
+| Queue | What it holds |
+| --- | --- |
+| `worker.tasks` | Tasks published by the control plane, waiting for the worker |
+| `controlplane.task-updates` | Progress updates published by the worker, waiting for the control plane |
+| `controlplane.task-updates.dlq` | Poison updates the control plane rejected |
+
+With everything running, both main queues drain within seconds; the **Overview** page
+shows the message rates. `docker compose logs -f control-plane worker` shows each task the
+worker takes and each update the control plane applies (`applied`, `duplicate`, `stale`).
+
+### 4. Update and delete
+
+1. **PATCH /v1/tenants/{tenant_id}** → paste the id → **Execute** (the example sends
+   `"version": 2`, the version of a freshly active tenant). `202`: `updating`, version 3.
+2. **Execute the same request again**: `409 tenant_version_conflict` ("version 2 is stale;
+   current version is 3" or 4). Optimistic locking stops the lost update.
+3. **GET** the tenant: back to `active`, version 4, new name.
+4. **DELETE /v1/tenants/{tenant_id}**: `202`, `destroying`; **GET** shortly after:
+   `destroyed`, version 6. `version` rose on every change, including the worker's.
+
+### 5. Negative scenarios: restart the worker with other settings
+
+| Scenario | bash | PowerShell |
+| --- | --- | --- |
+| Every task fails | `WORKER_FAIL_RATE=1 docker compose up -d worker` | `$env:WORKER_FAIL_RATE="1"; docker compose up -d worker; Remove-Item Env:WORKER_FAIL_RATE` |
+| Duplicates and out-of-order updates | `docker compose stop worker` then `docker compose run --rm worker --duplicate-rate=1 --reorder` (runs in the foreground; Ctrl+C when done) | same |
+| Back to normal | `docker compose up -d worker` | same |
+
+Then create a tenant (step 2). With failures: the tenant ends `failed` and its task carries
+the error; DELETE still works from `failed`. With duplicates and reordering: the logs show
+`done: applied`, `done: duplicate`, `in_progress: stale`, and the tenant still ends
+`active` at version 2. All flags: [Worker simulator](#worker-simulator).
+
+### 6. Negative scenarios: publish to the broker directly
+
+First stop the worker, so only your messages touch the task; then create a tenant
+(step 2) and copy `task.id` from the response. It stays `provisioning`, as nobody works on it.
+
+```bash
+docker compose stop worker
+# create a tenant now, then:
+docker compose --profile tools run --rm publish duplicate <task-id>   # done, twice
+docker compose --profile tools run --rm publish stale <task-id>       # done, then late in_progress
+docker compose --profile tools run --rm publish poison                # not a task update at all
+docker compose --profile tools run --rm publish unknown-task          # well formed, no such task
+docker compose logs --tail 20 control-plane
+docker compose start worker
+```
+
+Each run prints what it sent and what to expect. `duplicate` changes the tenant once;
+`stale` leaves the task `done`; `poison` and `unknown-task` land in
+`controlplane.task-updates.dlq` (watch its count in the dashboard) and the consumer keeps
+going. When the worker starts again its own updates for that task are `stale`.
+
+With the broker's own tooling instead: dashboard → **Exchanges** → `task-updates` →
+**Publish message**, routing key `task.update.done`, payload:
+
+```json
+{"schema_version": 1, "message_id": "8d1c3f0e-0000-4000-8000-000000000001",
+ "task_id": "<task-id>", "tenant_id": "<tenant-id>", "status": "done", "error": null,
+ "occurred_at": "2026-11-13T10:00:00.000Z"}
+```
+
+Publish it twice: the second is a `duplicate`. Change `task_id` to any other UUID: dead-lettered.
+
+### 7. Look inside
+
+See [Inspecting the system](#inspecting-the-system) for log commands and SQL queries over
+the outbox, the idempotency records and the task history.
+
+### 8. Reset
+
+```bash
+docker compose down -v      # stop everything and delete all data
+```
+
+## Design decisions and trade-offs
+
+| Decision | Why | Trade-off |
+| --- | --- | --- |
+| **Transactional outbox** for publishing | The task and its event commit in one transaction; a relay publishes committed rows. Nothing is published before commit or on rollback, and a crash between commit and publish cannot lose the event | Up to ~200 ms extra latency; delivery is at-least-once, so consumers must be idempotent |
+| **At-least-once everywhere, idempotent consumer** | Exactly-once delivery does not exist. Each update's `message_id` is stored in `processed_messages` in the same transaction as its effect; ack only after commit | One extra table and insert per update; the table grows (cleanup is future work) |
+| **Forward-only task status** (accepted 0, in_progress 1, done/failed 2) | Order tolerance without sequence numbers: a `done` before `in_progress` is kept and the late `in_progress` ignored; nothing moves a finished task | A worker cannot "undo" an outcome; a new task is needed instead |
+| **Optimistic locking with `version` in the PATCH body, 409 on conflict** | One guarded `UPDATE ... WHERE status = ANY(...) AND version = $n`: of two concurrent PATCHes exactly one matches. Body field keeps the API simple for clients | Not the HTTP `If-Match` / 412 convention; documented instead |
+| **Database constraints decide races** | `UNIQUE (slug)` settles concurrent creates; the guarded `UPDATE` settles PATCH/DELETE races; a partial unique index backstops "one open task per tenant" | Rules exist in both Python (for clear errors) and SQL (for correctness) |
+| **Plain SQL with asyncpg, no ORM** | The concurrency guarantees live in exact statements, which stay visible and reviewable in one file | More hand-written mapping code |
+| **RabbitMQ** | Task-queue semantics built in: durable quorum queues, publisher confirms, manual acks, dead-letter exchanges; runs locally | Not a replayable log like Kafka; SQS was ruled out as it does not run locally |
+| **Worker update ids are `uuid5(task id, status)`** | A task redone after a worker crash sends the same ids, so repeats dedupe | Two different "done" reports for one task would share an id (cannot happen: a task has one outcome) |
+| **Poison handling**: reject without requeue, retry transient errors with backoff, dead-letter after 5 deliveries | One bad message never blocks or kills the consumer | Dead-lettered messages need a person (no replay tool yet) |
+| **Consumer and relay run inside the API process** | One deployable control plane, simple to run and reason about | They scale with the API; a separate deployment would be the next step under load |
+| **400 `validation_failed`** instead of FastAPI's 422 | One error shape and status family for every bad input | Deviates from FastAPI's default; the OpenAPI document is adjusted to match |
+| **Keyset pagination** on `(created_at, id)` | Stable pages while rows are inserted; uses an index | No "jump to page N" |
+| **No authentication** | Not in the brief; kept out to stay focused | Must sit behind an authenticating gateway before real use |
+| **Configuration from environment variables**; local-dev defaults committed in `compose.yaml` and `.env.example` | A cold clone boots with one command. The committed values are labelled local-only credentials for throwaway containers; `.env` is git-ignored | Real deployments must supply their own values (environment or a secrets manager) |
+
+The step-by-step flow through the code, with class diagrams, is in
+[docs/architecture.md](docs/architecture.md).
 
 ## API
 
@@ -239,7 +347,7 @@ not running.
 
 | Suite | Runs against | Covers |
 | --- | --- | --- |
-| `tests/unit` | Pure Python, fakes | Every tenant and task state transition, worker settings and simulation plan, outbox relay and consumer decisions (ack, retry, dead-letter), message formats, timestamps, cursors |
+| `tests/unit` | Pure Python, fakes | Every tenant and task state transition, worker settings and simulation plan, outbox relay and consumer decisions (ack, retry, dead-letter), message formats, the publish script's scenarios, timestamps, cursors |
 | `tests/api` | The HTTP app with faked services | Status codes, the error body and every error code, validation, OpenAPI document |
 | `tests/integration` | The real stack: API, PostgreSQL, RabbitMQ, worker | Full lifecycle with no manual step; failed deploy then destroy; destroyed slugs stay taken; 20 parallel creates with one slug, 50 parallel PATCHes with one version and 10 parallel DELETEs each have exactly one winner and leave nothing behind; one published event per task; rejected writes publish nothing; duplicate updates change state once; a late `in_progress` never regresses `done`; poison messages go to the dead-letter queue while the consumer keeps going |
 
@@ -248,10 +356,46 @@ control over order and duplication, so they do not depend on the worker's random
 Run outside the compose network (plain `pytest`), they are skipped with a message saying how
 to run them.
 
+GitHub Actions runs the same two commands, boot then `check`, on every push
+([.github/workflows/check.yml](.github/workflows/check.yml)); the badge at the top shows
+the latest result.
+
 Two behaviours are shown by manual runs rather than automated tests, because they need the
 broker or the control plane stopped mid-test: a write while RabbitMQ is down is published once
 it returns ([evidence](docs/evidence/outbox-broker-outage.md)), and data survives restarts
 (the same tenants persist across every rebuild in the [evidence pages](docs/evidence/README.md)).
+
+## Inspecting the system
+
+```bash
+docker compose ps                                      # what is running and healthy
+docker compose logs -f control-plane worker            # API requests, relay, consumer, worker
+curl -s localhost:8000/readyz                          # {"status":"ready","database":true,"broker":true}
+```
+
+Health-probe requests (`/healthz`, `/readyz`, polled by Docker every few seconds) are
+left out of the access log so the useful lines stay readable.
+
+SQL, through `docker compose exec postgres psql -U tenants -d tenants -c "<query>"`:
+
+| Question | Query |
+| --- | --- |
+| Latest tenants | `SELECT slug, status, version, updated_at FROM tenants ORDER BY created_at DESC LIMIT 10;` |
+| Events waiting or published | `SELECT routing_key, attempts, published_at FROM outbox ORDER BY id DESC LIMIT 10;` |
+| Updates applied per task | `SELECT task_id, count(*) FROM processed_messages GROUP BY task_id ORDER BY count(*) DESC LIMIT 10;` |
+| A tenant's task history | `SELECT type, status, error, created_at FROM tasks WHERE tenant_id = '<tenant-id>' ORDER BY created_at;` |
+
+The RabbitMQ dashboard's **Queues** page can also show any message without consuming it:
+open a queue → **Get messages** with "Nack message requeue true".
+
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | Layers and class diagram, startup sequence, step-by-step lifecycle of a request through the outbox, the worker and the consumer |
+| [docs/evidence/](docs/evidence/README.md) | Manual runs against the real stack, with commands, output and screenshots |
+| [requests.http](requests.http) | Click-through API tour for the VS Code REST Client extension, carrying ids and versions between requests |
+| <http://localhost:8000> | Interactive API reference (after boot), generated from the code |
 
 ## Tech stack
 
@@ -299,6 +443,7 @@ app/
     config.py               settings from environment variables
     clock.py                UTC millisecond timestamps
     backoff.py              exponential backoff with jitter
+    logs.py                 keeps health-probe requests out of the access log
     pagination.py           keyset cursors
 migrations/               SQL schema, applied at startup
 worker/                   worker simulator (separate process)
@@ -310,5 +455,16 @@ tests/
   api/                    HTTP contract with faked services
   integration/            end to end against the running stack
 requests.http             click-through API tour (VS Code REST Client)
-scripts/                  quality-gate script
+scripts/                  check.sh (quality gate), publish_update.py (hand-made broker messages)
+.github/workflows/        CI: the same boot and check commands on every push
 ```
+
+## What I would do next
+
+- **Cleanup jobs** for published outbox rows and old `processed_messages`.
+- **Dead-letter replay**: a command to inspect and re-publish messages from the DLQ.
+- **Metrics and tracing**: outbox lag, consumer throughput and failures, a trace id carried
+  from the request through the task to the worker's updates.
+- **Authentication and per-tenant authorization** in front of the API.
+- **Retry delay queues** instead of in-process backoff, so a slow retry does not hold a consumer slot.
+- **A broker-outage test** in CI (stop RabbitMQ mid-test), today shown by a manual run.

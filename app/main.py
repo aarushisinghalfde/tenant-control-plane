@@ -12,6 +12,7 @@ from app.api.error_handlers import register_error_handlers
 from app.api.openapi import install_openapi
 from app.api.routes import health, tasks, tenants
 from app.core.config import load_settings
+from app.core.logs import HealthCheckAccessFilter
 from app.db.database import Database, create_pool, run_migrations
 from app.messaging.broker import TASK_UPDATES_QUEUE, Broker
 from app.messaging.consumer import PREFETCH, UpdateConsumer
@@ -33,6 +34,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logging.basicConfig(
         level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s"
     )
+    logging.getLogger("uvicorn.access").addFilter(HealthCheckAccessFilter())
     pool = await create_pool(settings.database_url)
     try:
         await run_migrations(pool)

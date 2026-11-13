@@ -86,9 +86,10 @@ class TenantUpdate(_Request):
         ge=1,
         description=(
             "The tenant's current `version`, from your last read. If the tenant changed since, "
-            "the request fails with 409 `tenant_version_conflict` instead of overwriting."
+            "the request fails with 409 `tenant_version_conflict` instead of overwriting. "
+            "A newly created tenant is at version 2 once it is `active`."
         ),
-        examples=[1],
+        examples=[2],
     )
 
     @model_validator(mode="after")

@@ -235,6 +235,13 @@ def test_invalid_query_parameters_are_400(client: TestClient, params: dict[str, 
     assert response.json()["error"]["code"] == "validation_failed"
 
 
+def test_root_redirects_to_the_interactive_docs(client: TestClient) -> None:
+    response = client.get("/", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "/docs"
+
+
 def test_unknown_route_uses_the_same_error_shape(client: TestClient) -> None:
     response = client.get("/v1/nope")
 
@@ -255,3 +262,13 @@ def test_openapi_documents_the_real_error_shape(client: TestClient) -> None:
     assert conflict["schema"]["$ref"].endswith("/ErrorResponse")
     assert set(conflict["examples"]) == {"tenant_version_conflict", "tenant_update_not_allowed"}
     assert "HTTPValidationError" not in schema["components"]["schemas"]
+
+
+def test_openapi_400_examples_cover_bodies_and_parameters(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    bad_request = schema["paths"]["/v1/tasks"]["get"]["responses"]["400"]
+    examples = bad_request["content"]["application/json"]["examples"]
+
+    assert set(examples) == {"invalid body field", "invalid query or path parameter"}
+    fields = {examples[name]["value"]["error"]["details"][0]["field"] for name in examples}
+    assert fields == {"body.slug", "query.limit"}

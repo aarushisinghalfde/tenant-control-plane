@@ -57,7 +57,11 @@ class UpdateConsumer:
         try:
             update = TaskUpdate.model_validate_json(message.body)
         except ValidationError as exc:
-            await self._dead_letter(message, f"not a valid task update: {exc.error_count()} errors")
+            problems = exc.error_count()
+            await self._dead_letter(
+                message,
+                f"not a valid task update ({problems} problem{'s' if problems != 1 else ''})",
+            )
             return
 
         try:
