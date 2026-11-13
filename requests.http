@@ -24,14 +24,15 @@ GET {{baseUrl}}/v1/tenants/{{create.response.body.$.tenant.id}}/tasks
 ### 4. The deploy task on its own
 GET {{baseUrl}}/v1/tasks/{{create.response.body.$.task.id}}
 
-### 5. Rename it, passing the version from step 2: 202, "updating"
+### 5. Rename it: 202, "updating". Uses the version from step 2, so send step 2
+# First send step 2 (until it shows "active"); otherwise this goes out with no version: 400.
 # @name update
 PATCH {{baseUrl}}/v1/tenants/{{create.response.body.$.tenant.id}}
 Content-Type: application/json
 
 {"name": "Demo Corp Renamed", "version": {{get.response.body.$.version}}}
 
-### 6. Same PATCH again with the old version: 409 tenant_version_conflict
+### 6. Same PATCH again with the version step 2 returned, now stale: 409 tenant_version_conflict
 PATCH {{baseUrl}}/v1/tenants/{{create.response.body.$.tenant.id}}
 Content-Type: application/json
 

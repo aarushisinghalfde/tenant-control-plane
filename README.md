@@ -129,13 +129,13 @@ sequenceDiagram
     participant R as Outbox relay
     participant MQ as RabbitMQ
     C->>API: POST /v1/tenants
-    API->>DB: BEGIN; INSERT tenant, task, outbox row; COMMIT
+    API->>DB: one transaction: INSERT tenant, task, outbox row, then COMMIT
     API-->>C: 202 {tenant, task}
     loop every 200 ms
         R->>DB: SELECT unpublished rows FOR UPDATE SKIP LOCKED
         R->>MQ: publish (persistent, publisher confirm)
         MQ-->>R: ack
-        R->>DB: SET published_at; COMMIT
+        R->>DB: SET published_at, then COMMIT
     end
 ```
 
