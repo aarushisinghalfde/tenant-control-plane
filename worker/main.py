@@ -14,7 +14,7 @@ import os
 import random
 import signal
 import sys
-from collections.abc import Awaitable, Sequence
+from collections.abc import Sequence
 from typing import Protocol
 from uuid import UUID
 
@@ -23,7 +23,7 @@ from pydantic import ValidationError
 
 from app.core.clock import utc_now
 from app.domain.models import TaskStatus
-from app.messaging.broker import WORKER_TASKS_QUEUE, Broker
+from app.messaging.broker import WORKER_TASKS_QUEUE, Broker, settle
 from app.messaging.events import TaskEvent, TaskUpdate
 from worker.config import WorkerConfig, parse_config
 from worker.simulation import FAILURE_REASON, plan_steps
@@ -68,10 +68,10 @@ class Worker:
             # done again later; the pause keeps a persistent fault from spinning.
             logger.exception("task %s: could not report progress; requeueing", event.id)
             await asyncio.sleep(self._requeue_pause)
-            await _settle(message.nack(requeue=True))
+            await settle(message.nack(requeue=True))
             return
 
-        await _settle(message.ack())  # only after every update was confirmed
+        await settle(message.ack())  # only after every update was confirmed
 
     async def _simulate(self, event: TaskEvent) -> None:
         logger.info("task %s: %s for tenant %s", event.id, event.type, event.tenant.slug)
@@ -94,14 +94,6 @@ class Worker:
             )
             note = " (duplicate)" if step.duplicate else ""
             logger.info("task %s: sent %s%s", event.id, step.status, note)
-
-
-async def _settle(action: Awaitable[None]) -> None:
-    """Await an ack or nack; if the channel is already gone, the broker redelivers anyway."""
-    try:
-        await action
-    except Exception:
-        logger.warning("could not ack/nack; the broker will redeliver", exc_info=True)
 
 
 async def run(config: WorkerConfig) -> None:

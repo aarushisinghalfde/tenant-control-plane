@@ -14,6 +14,7 @@ provisioning work, and reports progress back over the broker.
 | [docs/evidence/](docs/evidence/README.md) | Manual runs against the real stack, with commands, output and screenshots |
 | [Broker outage](docs/evidence/outbox-broker-outage.md) | Writes succeed while RabbitMQ is down; the event is published once it returns |
 | [Rejected writes](docs/evidence/rejected-writes.md) | Duplicate slugs, stale versions and invalid transitions are refused and publish nothing |
+| [Worker simulator](docs/evidence/worker-simulator.md) | The worker drains queued tasks and reports `in_progress` then an outcome for each |
 | <http://localhost:8000/docs> | Interactive API reference (after boot), generated from the code |
 
 ## Prerequisites
@@ -145,13 +146,27 @@ sequenceDiagram
 | `task-updates` (topic) | `task.update.<status>` | `controlplane.task-updates` | worker -> control plane |
 | `task-updates.dlx` (fanout) | any | `controlplane.task-updates.dlq` | rejected (poison) updates |
 
+Updates flow back through the **update consumer** inside the control plane. Each one is
+applied in a single transaction that also records its `message_id` in
+`processed_messages`, and the message is acknowledged only after that commit:
+
+- **Idempotent.** A `message_id` already recorded is a duplicate: acknowledged, nothing changes.
+- **Order-tolerant.** Tasks only move forward (`accepted` -> `in_progress` -> `done`/`failed`).
+  A late `in_progress` after `done`, or anything for a finished task, is acknowledged and ignored.
+- **Tenant follows the outcome.** `done` or `failed` moves the tenant (for example
+  `provisioning` -> `active`) and bumps its `version`.
+- **Poison messages** (invalid JSON or schema, unknown task, wrong tenant) are rejected into
+  `controlplane.task-updates.dlq` and the consumer carries on.
+- **Temporary failures** (database down) are retried with backoff; after 5 deliveries the
+  message is dead-lettered instead of blocking the queue.
+
 All queues are durable quorum queues and all messages are persistent. `/readyz` reports
 ready only while both the database and the broker connection are up.
 
 ## Worker simulator
 
 A separate process (`worker/`, compose service `worker`) that plays the provisioning
-side. For each task on `worker.tasks` it waits, publishes `in_progress`, waits, publishes
+side; with it running, a new tenant walks `provisioning` -> `active` on its own. For each task on `worker.tasks` it waits, publishes `in_progress`, waits, publishes
 `done` or `failed` to the `task-updates` exchange, and only then acknowledges the task.
 
 Each update carries its own idempotency key and names the task and tenant it is about:
@@ -230,6 +245,7 @@ app/
   services/               use cases, one transaction per state change
     tenant_service.py
     task_service.py
+    task_update_service.py  one worker update -> task and tenant, in one transaction
   domain/                 business rules, pure logic with no I/O
     models.py               entities and statuses
     rules.py                tenant and task state machines
@@ -238,9 +254,10 @@ app/
     database.py             pool, migrations, transactions
     repository.py           all SQL
   messaging/              broker integration
-    events.py               message formats
-    broker.py               RabbitMQ connection, topology, confirmed publishing
+    events.py               message formats: TaskEvent (out), TaskUpdate (in)
+    broker.py               RabbitMQ connection, topology, publishing, consuming
     outbox_relay.py         background loop: outbox rows -> broker
+    consumer.py             applies worker updates; dedupe, retry, dead-letter
   core/                   shared helpers with no business knowledge
     config.py               settings from environment variables
     clock.py                UTC millisecond timestamps

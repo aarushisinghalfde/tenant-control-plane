@@ -13,6 +13,7 @@ queued is lost when the broker restarts.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final
@@ -26,6 +27,8 @@ from aio_pika.abc import (
     AbstractIncomingMessage,
     AbstractRobustConnection,
 )
+
+logger = logging.getLogger(__name__)
 
 TASKS_EXCHANGE: Final = "tasks"
 WORKER_TASKS_QUEUE: Final = "worker.tasks"
@@ -150,3 +153,15 @@ async def _publish(
         delivery_mode=DeliveryMode.PERSISTENT,
     )
     await exchange.publish(message, routing_key=routing_key, timeout=PUBLISH_TIMEOUT_SECONDS)
+
+
+async def settle(action: Awaitable[None]) -> None:
+    """Await an ack, nack or reject without raising.
+
+    If the channel is already gone the broker never got the answer and will redeliver
+    the message, which every consumer here handles; so log and carry on.
+    """
+    try:
+        await action
+    except Exception:
+        logger.warning("could not ack/nack/reject; the broker will redeliver", exc_info=True)

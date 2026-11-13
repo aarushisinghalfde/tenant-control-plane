@@ -156,6 +156,38 @@ class Repository:
         )
         return _task(row) if row is not None else None
 
+    async def lock_task(self, task_id: UUID) -> Task | None:
+        """Read a task and lock its row until the transaction ends.
+
+        Two updates for the same task (say `in_progress` and `done` delivered in parallel)
+        then run one after the other, each seeing the other's result.
+        """
+        row = await self._conn.fetchrow(
+            """
+            SELECT id, tenant_id, type, status, error, created_at, updated_at
+            FROM tasks
+            WHERE id = $1
+            FOR UPDATE
+            """,
+            task_id,
+        )
+        return _task(row) if row is not None else None
+
+    async def update_task_status(
+        self, task_id: UUID, *, status: TaskStatus, error: str | None, now: datetime
+    ) -> None:
+        await self._conn.execute(
+            """
+            UPDATE tasks
+            SET status = $2, error = $3, updated_at = $4
+            WHERE id = $1
+            """,
+            task_id,
+            status.value,
+            error,
+            now,
+        )
+
     async def list_tasks(
         self,
         *,
@@ -185,6 +217,26 @@ class Repository:
             limit,
         )
         return [_task(row) for row in rows]
+
+    # --- inbox (consumer idempotency) ----------------------------------------------
+
+    async def record_processed_message(self, message_id: UUID, task_id: UUID) -> bool:
+        """Remember that an update was applied; False if it already was (a duplicate).
+
+        Runs in the same transaction as the change it guards, so "applied" and
+        "recorded" can never disagree: both commit or neither does.
+        """
+        inserted = await self._conn.fetchval(
+            """
+            INSERT INTO processed_messages (message_id, task_id)
+            VALUES ($1, $2)
+            ON CONFLICT (message_id) DO NOTHING
+            RETURNING message_id
+            """,
+            message_id,
+            task_id,
+        )
+        return inserted is not None
 
     # --- outbox -----------------------------------------------------------------
 

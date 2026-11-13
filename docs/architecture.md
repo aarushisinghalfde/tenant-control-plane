@@ -1,8 +1,8 @@
 # Architecture
 
 How the code is organised, how the classes connect, and what happens step by step
-when a tenant is created. Covers what is built so far (API, database, outbox relay,
-RabbitMQ, worker simulator); the update consumer, arriving in phase 7, is marked *planned*.
+when a tenant is created. Covers the whole loop: API, database, outbox relay, RabbitMQ, worker
+simulator and update consumer.
 
 ## Layers
 
@@ -21,6 +21,7 @@ flowchart TD
     subgraph services["services - use cases"]
         tenant_service["TenantService<br/>create / update / delete / get / list"]
         task_service["TaskService<br/>get / list"]
+        update_service["TaskUpdateService<br/>apply one worker update"]
     end
 
     subgraph domain["domain - pure rules, no I/O"]
@@ -38,7 +39,7 @@ flowchart TD
         event["TaskEvent<br/>message body"]
         relay["OutboxRelay<br/>background loop"]
         broker["Broker<br/>confirmed publish"]
-        consumer["Update consumer<br/>(planned, phase 7)"]
+        consumer["UpdateConsumer<br/>dedupe, retry, dead-letter"]
     end
 
     postgres[(PostgreSQL<br/>tenants, tasks, outbox,<br/>processed_messages)]
@@ -64,11 +65,10 @@ flowchart TD
     health --> broker
     rabbitmq -->|worker.tasks| worker
     worker -->|task-updates| rabbitmq
-    rabbitmq -.->|controlplane.task-updates| consumer
-    consumer -.-> database
-
-    classDef planned stroke-dasharray: 5 5
-    class consumer planned
+    rabbitmq -->|controlplane.task-updates| consumer
+    consumer --> update_service
+    update_service --> rules
+    update_service --> database
 ```
 
 `app/main.py` wires it all together at startup (the `lifespan` function); `app/core`
@@ -78,10 +78,10 @@ several layers.
 | Layer | Classes and functions | Responsibility |
 | --- | --- | --- |
 | `api` | `tenants.router`, `tasks.router`, `health.router`, request/response schemas, `error_handlers` | HTTP only: validate input, call a service, shape the response, map errors to status codes |
-| `services` | `TenantService`, `TaskService` | One use case per method; every state change is one database transaction |
+| `services` | `TenantService`, `TaskService`, `TaskUpdateService` | One use case per method; every state change is one database transaction |
 | `domain` | `Tenant`, `Task`, statuses, `TASK_RULES`, rule functions, `DomainError` subclasses | The state machines and error codes; pure Python, unit-tested in isolation |
 | `db` | `Database`, `Repository`, `OutboxEvent` | Connection pool, migrations, transactions; every SQL statement |
-| `messaging` | `TaskEvent`, `Broker`, `declare_topology`, `OutboxRelay` | Message formats, RabbitMQ topology and publishing |
+| `messaging` | `TaskEvent`, `TaskUpdate`, `Broker`, `declare_topology`, `OutboxRelay`, `UpdateConsumer` | Message formats, RabbitMQ topology, publishing and consuming |
 | `core` | `Settings`, `utc_now`, `Cursor`, `backoff_delay` | Shared helpers with no business knowledge |
 
 ## Startup
@@ -93,9 +93,10 @@ several layers.
 3. `run_migrations()` applies any new `migrations/*.sql`, holding an advisory lock so two replicas cannot migrate at once.
 4. `Broker.connect()` opens a self-healing RabbitMQ connection and runs `declare_topology()`: exchanges, quorum queues, bindings and the dead-letter queue.
 5. `OutboxRelay(db, broker).run()` starts as a background task.
-6. `TenantService` and `TaskService` are created and stored on `app.state`, where the routes find them.
+6. `UpdateConsumer` starts consuming `controlplane.task-updates`, at most 4 updates at a time.
+7. `TenantService` and `TaskService` are created and stored on `app.state`, where the routes find them.
 
-Shutdown runs in reverse: cancel the relay, close the broker connection, close the pool.
+Shutdown runs in reverse: cancel the relay, close the broker connection (which also stops the consumer; unacknowledged updates are redelivered later), close the pool.
 
 ## Lifecycle of `POST /v1/tenants`
 
@@ -155,11 +156,21 @@ transaction rolls back, so no task or outbox row is written.
 
 ## The worker simulator (phase 6)
 
-12. The **worker** (`worker/main.py`, class `Worker`) consumes `worker.tasks`, at most `--concurrency` tasks at a time. For each it asks `plan_steps()` (`worker/simulation.py`) what to send: `in_progress` then `done`, or `failed` with probability `--fail-rate`, optionally reordered or duplicated. It publishes each `TaskUpdate` to the `task-updates` exchange with publisher confirms, and acknowledges the task only after the last update is confirmed. A malformed task is rejected without requeue; if the broker fails mid-task, the task is requeued and redone, and because each `message_id` is `uuid5(task id, status)`, the repeats look like duplicates to the consumer. Until phase 7 the updates wait in `controlplane.task-updates`.
+12. The **worker** (`worker/main.py`, class `Worker`) consumes `worker.tasks`, at most `--concurrency` tasks at a time. For each it asks `plan_steps()` (`worker/simulation.py`) what to send: `in_progress` then `done`, or `failed` with probability `--fail-rate`, optionally reordered or duplicated. It publishes each `TaskUpdate` to the `task-updates` exchange with publisher confirms, and acknowledges the task only after the last update is confirmed. A malformed task is rejected without requeue; if the broker fails mid-task, the task is requeued and redone, and because each `message_id` is `uuid5(task id, status)`, the repeats look like duplicates to the consumer.
 
-## Planned: applying updates (phase 7)
+## Applying updates (phase 7)
 
-13. The **update consumer** in the control plane reads `controlplane.task-updates`. In one transaction it records the `message_id` in `processed_messages` (a duplicate is skipped), checks `can_apply_task_update()` so a stale update cannot move the task backwards, updates the task, and on a terminal outcome moves the tenant (`tenant_status_after()`) and bumps its version. It acknowledges the message only after commit; a malformed message is rejected into the dead-letter queue.
+13. The **update consumer** (`app/messaging/consumer.py`, class `UpdateConsumer`) reads `controlplane.task-updates`, at most 4 at a time, and for each delivery:
+    1. Parses it as a `TaskUpdate`. Anything else is poison: rejected without requeue, so RabbitMQ moves it to `controlplane.task-updates.dlq`.
+    2. Calls `TaskUpdateService.apply()`, which in **one transaction**:
+       - inserts the `message_id` into `processed_messages` (`ON CONFLICT DO NOTHING`); if it was already there the update is a **duplicate** and nothing else happens;
+       - locks the task row (`SELECT ... FOR UPDATE`), so two updates for one task run one after the other; an unknown task, or one owned by another tenant, raises `UnusableUpdateError` and the message is dead-lettered;
+       - asks `can_apply_task_update()`; an update that would move the task backwards or past its end is **stale**: nothing changes, but the idempotency record still commits;
+       - otherwise updates the task, and on `done` or `failed` moves the tenant from the task's in-flight status to `tenant_status_after()`, bumping its `version`.
+    3. Acknowledges only after the commit. A crash in between means redelivery, which step 2 turns into a harmless duplicate.
+    4. On any other error (say the database is down) it waits with backoff and requeues; after 5 deliveries (RabbitMQ's `x-delivery-count` header) it dead-letters the message so it cannot block the queue.
+
+    `handle()` never raises, so one bad message never stops the consumer.
 
 ## Related documents
 

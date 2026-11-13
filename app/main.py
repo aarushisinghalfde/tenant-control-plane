@@ -13,17 +13,21 @@ from app.api.openapi import install_openapi
 from app.api.routes import health, tasks, tenants
 from app.core.config import load_settings
 from app.db.database import Database, create_pool, run_migrations
-from app.messaging.broker import Broker
+from app.messaging.broker import TASK_UPDATES_QUEUE, Broker
+from app.messaging.consumer import PREFETCH, UpdateConsumer
 from app.messaging.outbox_relay import OutboxRelay
 from app.services.task_service import TaskService
+from app.services.task_update_service import TaskUpdateService
 from app.services.tenant_service import TenantService
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Startup: settings, database, migrations, broker, outbox relay, services.
+    """Startup: settings, database, migrations, broker, outbox relay, update consumer,
+    services.
 
-    Shutdown runs in reverse: stop the relay, close the broker, close the pool.
+    Shutdown runs in reverse: stop the relay, close the broker (which stops the
+    consumer; unacknowledged updates are redelivered later), close the pool.
     """
     settings = load_settings()
     logging.basicConfig(
@@ -36,6 +40,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         broker = await Broker.connect(settings.rabbitmq_url)
         relay = asyncio.create_task(OutboxRelay(db, broker).run(), name="outbox-relay")
         try:
+            consumer = UpdateConsumer(TaskUpdateService(db))
+            await broker.consume(TASK_UPDATES_QUEUE, consumer.handle, prefetch=PREFETCH)
             app.state.db = db
             app.state.broker = broker
             app.state.tenant_service = TenantService(db)
